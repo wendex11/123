@@ -1,0 +1,321 @@
+const ALLOWED_ITEMS = [
+  "Кофе",
+  "Помидор",
+  "Молоко",
+  "Гипс",
+  "Железо",
+  "Реагенты",
+  "Аммиак",
+  "Остатки приборов шепота",
+  "Отличная тушенка",
+  "Газовый баллон",
+  "Перчатки",
+  "Чеснок",
+  "Поташ",
+  "Мясо шавки",
+  "Мясо кабана",
+  "Мясо хрюши"
+];
+
+const ITEM_ENUM = [...ALLOWED_ITEMS];
+
+const resultSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          name: {
+            type: "string",
+            enum: ITEM_ENUM
+          },
+          quantity: {
+            type: "integer",
+            minimum: 0
+          },
+          confidence: {
+            type: "number",
+            minimum: 0,
+            maximum: 1
+          }
+        },
+        required: [
+          "name",
+          "quantity",
+          "confidence"
+        ]
+      }
+    }
+  },
+  required: ["items"]
+};
+
+export async function onRequestPost(context) {
+  try {
+    const body = await context.request.json();
+
+    const image = body?.image;
+
+    if (
+      typeof image !== "string" ||
+      !image.startsWith("data:image/")
+    ) {
+      return json(
+        {
+          error:
+            "Не получено изображение в формате data URL."
+        },
+        400
+      );
+    }
+
+    if (image.length > 15_000_000) {
+      return json(
+        {
+          error:
+            "Изображение слишком большое."
+        },
+        413
+      );
+    }
+
+    const apiKey =
+      context.env.OPENAI_API_KEY;
+
+    if (!apiKey) {
+      return json(
+        {
+          error:
+            "На сервере не настроен OPENAI_API_KEY."
+        },
+        500
+      );
+    }
+
+    const prompt = `
+Ты анализируешь скриншот игрового инвентаря.
+
+Твоя задача — найти ТОЛЬКО предметы из этого списка:
+
+${ALLOWED_ITEMS.map(
+  item => `- ${item}`
+).join("\n")}
+
+Правила:
+
+1. Порядок предметов на изображении не имеет значения.
+2. Предметы могут находиться в любых местах.
+3. Один и тот же предмет может встретиться несколько раз.
+4. Если один предмет встретился несколько раз, сложи количества.
+5. Игнорируй абсолютно все предметы, которых нет в разрешённом списке.
+6. Не придумывай отсутствующие предметы.
+7. Количество должно быть целым положительным числом.
+8. Если количество невозможно уверенно прочитать, не добавляй такой предмет.
+9. Название должно быть ровно одним из значений разрешённого списка.
+10. confidence — твоя оценка уверенности именно в распознавании пары "предмет + количество", от 0 до 1.
+11. НЕ считай деньги.
+12. НЕ вычисляй цены.
+13. НЕ используй названия продавцов.
+14. Верни только структурированный результат.
+
+Особенно внимательно проверяй маленькие числа возле иконок предметов.
+`;
+
+    const openaiResponse =
+      await fetch(
+        "https://api.openai.com/v1/responses",
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+
+            "Authorization":
+              `Bearer ${apiKey}`
+          },
+
+          body: JSON.stringify({
+            model: "gpt-5",
+
+            input: [
+              {
+                role: "user",
+
+                content: [
+                  {
+                    type: "input_text",
+
+                    text: prompt
+                  },
+
+                  {
+                    type: "input_image",
+
+                    image_url: image,
+
+                    detail: "high"
+                  }
+                ]
+              }
+            ],
+
+            text: {
+              format: {
+                type: "json_schema",
+
+                name:
+                  "inventory_recognition",
+
+                strict: true,
+
+                schema:
+                  resultSchema
+              }
+            }
+          })
+        }
+      );
+
+    const responseText =
+      await openaiResponse.text();
+
+    let data = null;
+
+    try {
+      data =
+        JSON.parse(
+          responseText
+        );
+    } catch {
+      data = null;
+    }
+
+    if (!openaiResponse.ok) {
+      return json(
+        {
+          error:
+            data?.error?.message ||
+            "OpenAI API вернул ошибку."
+        },
+        openaiResponse.status
+      );
+    }
+
+    const outputText =
+      data?.output_text;
+
+    if (
+      typeof outputText !== "string"
+    ) {
+      return json(
+        {
+          error:
+            "ИИ не вернул текстовый результат."
+        },
+        500
+      );
+    }
+
+    let result;
+
+    try {
+      result =
+        JSON.parse(
+          outputText
+        );
+    } catch {
+      return json(
+        {
+          error:
+            "ИИ вернул некорректный JSON."
+        },
+        500
+      );
+    }
+
+    const safeItems =
+      Array.isArray(
+        result?.items
+      )
+        ? result.items
+            .filter(
+              item =>
+                ALLOWED_ITEMS.includes(
+                  item?.name
+                )
+            )
+            .map(
+              item => ({
+                name:
+                  item.name,
+
+                quantity:
+                  Math.max(
+                    0,
+                    Math.floor(
+                      Number(
+                        item.quantity
+                      ) || 0
+                    )
+                  ),
+
+                confidence:
+                  Math.max(
+                    0,
+                    Math.min(
+                      1,
+                      Number(
+                        item.confidence
+                      ) || 0
+                    )
+                  )
+              })
+            )
+            .filter(
+              item =>
+                item.quantity > 0
+            )
+        : [];
+
+    return json({
+      items:
+        safeItems
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    return json(
+      {
+        error:
+          "Внутренняя ошибка распознавания."
+      },
+      500
+    );
+  }
+}
+
+function json(
+  value,
+  status = 200
+) {
+  return new Response(
+    JSON.stringify(value),
+    {
+      status,
+
+      headers: {
+        "Content-Type":
+          "application/json; charset=utf-8",
+
+        "Cache-Control":
+          "no-store"
+      }
+    }
+  );
+}
